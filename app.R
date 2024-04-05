@@ -1,6 +1,5 @@
 #libraries
-pacman::p_load(shiny,shinydashboard,fresh,rhandsontable,shinyjs,rmarkdown,pagedown,pdftools,mcr,tinytex,shinycssloaders,knitr,digest)
-
+pacman::p_load(shiny,shinydashboard,fresh,rhandsontable,shinyjs,rmarkdown,pagedown,pdftools,mcr,tinytex,shinycssloaders,knitr,digest,htmlwidgets)
 # theme
 IVDCheckR_theme <- create_theme(adminlte_color(light_blue = "#003B73"),
                                 adminlte_sidebar(width = "250px",dark_bg = "#40668d",
