@@ -1,5 +1,9 @@
 # IVDCheckR - Simplifying documentation for laboratory developed tests according to IVDR requirements by introducing a digital tool 
 The tool is a guide for documentation for laboratory developed tests according to IVDR requirements. It further provides quick solution for routine clinical laboratory calculations such as method comparison and quality control assessment.
+
+# Official website
+https://kc.uol.de/ivdcheckr/
+
 # Packages used
 * shiny (https://cran.rproject.org/web/packages/shiny/index.html)
 * shinydashboard (https://cran.r-project.org/web/packages/shinydashboard/index.html)
