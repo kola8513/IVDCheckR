@@ -742,7 +742,7 @@ server <- function(input, output, session) {
   
   
   # Rename the columns
-  renamed_data <- rename(initial_data,
+  renamed_data <- dplyr::rename(initial_data,
                          "Product/Instrument/Software" = Product,
                          "Manufacturer"= Manufacturer,
                          "Product Number"= Product_number,
