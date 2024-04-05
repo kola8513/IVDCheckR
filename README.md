@@ -18,3 +18,4 @@ https://kc.uol.de/ivdcheckr/
 * shinycssloaders (https://cran.r-project.org/web/packages/shinycssloaders/index.html)
 * knitr (https://cran.r-project.org/web/packages/knitr/index.html)
 * digest (https://cran.r-project.org/web/packages/digest/index.html)
+* htmlwidgets (https://cran.r-project.org/web/packages/htmlwidgets/index.html)
