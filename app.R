@@ -288,7 +288,6 @@ ui <- dashboardPage(
       .custom-input textarea,
       .custom-input input {
         font-size: 22px;
-        font-family: 'Nunito Sans', sans-serif;
         text-align: justify;
       }
     "))
@@ -297,7 +296,7 @@ ui <- dashboardPage(
     tags$head(
       tags$style(
         HTML(
-          "#current_project_name {font-size: 22px; font-family: Nunito Sans; text-align: center; color: #fff; background-color: #003B73}"
+          "#current_project_name {font-size: 22px;  text-align: center; color: #fff; background-color: #003B73}"
         )
       )
     ),
@@ -311,7 +310,7 @@ ui <- dashboardPage(
 "),
     
     
-    tags$head(tags$style(HTML('* {font-size: 15px; font-family: "Nunito Sans"};'))),
+    tags$head(tags$style(HTML('* {font-size: 15px;}'))),
     
     
     useShinyjs(),
@@ -329,31 +328,31 @@ ui <- dashboardPage(
                   column(
                     width = 12,
                     br(),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                            Welcome to IVDCheckR, your comprehensive integration platform designed to ensure electronic IVDR compliance for your laboratory developed tests (LDTs) according to Article 5 (5) of the in Vitro Diagnostic Medical Device Regulation (EU) 2017/746 (EU-IVDR). Begin by pressing the start button below, you'll be directed to the LDT project details landing page, where you can enter specific details of your project.
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                            Welcome to IVDCheckR, your comprehensive integration platform designed to ensure IVDR compliance for your laboratory developed tests (LDTs) according to Article 5 (5) of the in Vitro Diagnostic Medical Device Regulation (EU) 2017/746 (EU-IVDR). Begin by pressing the start button below, you'll be directed to the LDT project details landing page, where you can enter specific details of your project.
 
                             </p>"),
                     
                     br(),
                     
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>Click <a href='https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A02017R0746-20230320' target='_blank' style='font-size: 22px; font-family: Nunito Sans;'>here</a> for the official website of the EU-IVDR.</p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>Click <a href='https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A02017R0746-20230320' target='_blank' style='font-size: 16px; '>here</a> for the official website of the EU-IVDR.</p>"),
                     
                     br(),
                     br(),
                     
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
                            How to use this tool: </p>"),
                     br(),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                           1. Enter the title of your project. </p>"),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                           2. Add specific details about your project in the project details tab , e.g., upload all relevant SOPs. </p>"),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                           3. Perform method comparison using the Method Comparison tab. </p>"),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                           4. Perform quality controls using the Quality Control tab. </p>"),
-                    HTML("<p style='font-size: 22px; font-family: Nunito Sans; text-align: justify;'>
-                           5. Press Download combined pdf to get a complete report of your project. </p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                           1. Press the 'Start' button. </p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                           2. Add specific details about your project in the project details tab. </p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                           3. Perform method comparison using the Method Comparison tab (optional). </p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                           4. Perform quality controls using the Quality Control tab (optional). </p>"),
+                    HTML("<p style='font-size: 16px;  text-align: justify;'>
+                           5. Download a combined PDF to get a complete report. </p>"),
                     br(),
                     
                     div(style = "text-align: center;",
@@ -382,17 +381,21 @@ ui <- dashboardPage(
                   status = "primary",
                   solidHeader = TRUE,
                   width = 6,
-                  style = "border: 1px solid #40668d; border-color:#40668d;display: flex; justify-content: left;",
+                  # style = "border: 1px solid #40668d; border-color:#40668d;display: flex; justify-content: left;",
                   column(width = 5,
                          #offset = 1,  # To center the first column
                          style = "white-space: nowrap;",
-                         tags$head(tags$style(type="text/css", "#someid {width: 600px}")),
-                         
+                         # tags$head(tags$style(type="text/css", "#someid {width: 600px;}")),
+                        
+                         textInput("projectInput",
+                                   label = HTML("<p  text-align: justify;'>Project title</p>"), value = ""),
+
+ 
                          # Date part
-                         dateRangeInput("dates", "Date", start = as.character(Sys.Date()), width = "500px",separator = " - "),
+                         tags$head(tags$style(HTML("#dates [type = 'text'] {height:35px;}"))),
+                         dateRangeInput("dates", "Evaluation period", start=as.character(Sys.Date()), end = as.character(Sys.Date()), separator = "-"),
+                        # dateRangeInput("dates", "Date", start = as.character(Sys.Date()), width = "500px",separator = " - "),
                          
-                         textInput("projectInput", 
-                                   label = HTML("<p font-family: Nunito Sans; text-align: justify;'>Enter the title of the project:</p>"), value = ""),
                          
                          
                          div(
@@ -742,11 +745,11 @@ server <- function(input, output, session) {
   
   # Rename the columns
   renamed_data <- dplyr::rename(initial_data,
-                         "Product/Instrument/Software" = Product,
-                         "Manufacturer"= Manufacturer,
-                         "Product Number"= Product_number,
-                         "Use Case" = Use_case,
-                         "Referred Document" = Refered_document)
+                                "Product/Instrument/Software" = Product,
+                                "Manufacturer"= Manufacturer,
+                                "Product Number"= Product_number,
+                                "Use Case" = Use_case,
+                                "Referred Document" = Refered_document)
   
   # Define the output
   output$exctable <- renderRHandsontable({
