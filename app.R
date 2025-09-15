@@ -698,9 +698,16 @@ ui <- dashboardPage(
             status = "primary",
             title = "List of used chemicals and software",
             solidHeader = TRUE,
-            width = 12, 
-            rHandsontableOutput("exctable",width = 800, height = 800)
-            
+            width = 12,
+            div(
+              style = "display: flex; flex-direction: row; align-items: flex-start;",
+              rHandsontableOutput("exctable", width = 800, height = 800),
+              actionButton(
+                "add_row",
+                "Add Row",
+                style = "background-color: #007bff; color: white; border: none; font-weight: bold; margin-left: 20px; margin-top: 10px; padding: 10px 20px; border-radius: 5px;"
+              )
+            )
           )
         )
       )
@@ -751,14 +758,27 @@ server <- function(input, output, session) {
                                 "Use Case" = Use_case,
                                 "Referred Document" = Refered_document)
   
-  # Define the output
-  output$exctable <- renderRHandsontable({
-    rhandsontable(renamed_data,manualColumnResize = TRUE) |>
-      hot_context_menu(allowRowEdit = T, allowColEdit = T,useTypes = FALSE) |>
-      onRender(jsCode)  
-    
+  #  a reactiveVal to hold the data
+  table_data <- reactiveVal(renamed_data)
+  
+  # row button logic
+  observeEvent(input$add_row, {
+    new_row <- renamed_data[1, ]
+    new_row[] <- ""   # blank row
+    table_data(rbind(table_data(), new_row))
   })
   
+  # Update table from user edits
+  observe({
+    if (!is.null(input$exctable)) {
+      table_data(hot_to_r(input$exctable))
+    }
+  })
+  
+  output$exctable <- renderRHandsontable({
+    rhandsontable(table_data(), manualColumnResize = TRUE, useTypes = TRUE) %>%
+      hot_context_menu(allowRowEdit = TRUE, allowColEdit = FALSE)
+  })
   
   
   # output$exctable <- renderRHandsontable({
