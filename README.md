@@ -19,3 +19,14 @@ https://kc.uol.de/ivdcheckr/
 * knitr (https://cran.r-project.org/web/packages/knitr/index.html)
 * digest (https://cran.r-project.org/web/packages/digest/index.html)
 * htmlwidgets (https://cran.r-project.org/web/packages/htmlwidgets/index.html)
+
+#  Publication 
+
+IVDCheckR has been peer-reviewed and published in the journal of Clinical Chemistry and Laboratory Medicine (CCLM). 
+The publication describes the development, validation, and application of this digital tool for IVDR-compliant documentation of laboratory developed tests.
+
+**Access the publication:** https://www.degruyterbrill.com/document/doi/10.1515/cclm-2024-0477/html
+
+If you use IVDCheckR in your work, please cite our publication.
+
+---
