@@ -9,14 +9,10 @@ https://kc.uol.de/ivdcheckr/
 * bslib (https://cran.r-project.org/web/packages/bslib/index.html)
 * rhandsontable (https://cran.r-project.org/web/packages/rhandsontable/index.html)
 * shinyjs (https://cran.r-project.org/web/packages/shinyjs/index.html)
-* rmarkdown (https://cran.r-project.org/web/packages/rmarkdown/index.html)
-* pagedown (https://cran.r-project.org/web/packages/pagedown/index.html)
 * pdftools (https://cran.r-project.org/web/packages/pdftools/index.html)
+* png (https://cran.r-project.org/web/packages/png/index.html)
 * mcr (https://cran.r-project.org/web/packages/mcr/index.html)
-* tinytex (https://cran.r-project.org/web/packages/tinytex/index.html)
 * shinycssloaders (https://cran.r-project.org/web/packages/shinycssloaders/index.html)
-* knitr (https://cran.r-project.org/web/packages/knitr/index.html)
-* digest (https://cran.r-project.org/web/packages/digest/index.html)
 * htmlwidgets (https://cran.r-project.org/web/packages/htmlwidgets/index.html)
 
 #  Publication 

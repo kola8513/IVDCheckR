@@ -1,7 +1,5 @@
 #libraries
-pacman::p_load(shiny,bslib,rhandsontable,shinyjs,rmarkdown,pagedown,pdftools,mcr,tinytex,shinycssloaders,knitr,digest,htmlwidgets)
-
-setwd(tempdir())
+pacman::p_load(shiny,bslib,rhandsontable,shinyjs,pdftools,png,mcr,shinycssloaders,htmlwidgets)
 
 # Define a function to sanitize inputs
 sanitize_input <- function(input) {
@@ -16,208 +14,793 @@ sanitize_input <- function(input) {
 }
 
 
-writeLines(
-  con = file.path(tempdir(), 'ivdcheckr.rmd'),
-  text = '---
-output: pdf_document
-params:
-  r: ""
----
+#-----------------------------------------------------------------------------------
+# PDF report engine (base-R graphics on a cairo_pdf device, no LaTeX)
+# Same engine and page design as the Peer Review reports (render_flex_report_pdf
+# in peerreviewrelease/app.R) and the Wartungsplan report; only the labels are in
+# English here and very long words are broken up in .pdfreport_wrap_tokens().
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center",
-                      fig.width = 6.5, fig.height = 5.5, out.width = "78%")
-r <- params$r
-```
+PDFREPORT_COL_PRIMARY <- "#003B73"
+PDFREPORT_COL_ACCENT  <- "#136377"
+PDFREPORT_COL_ROW_ALT <- "#eef3f8"
+PDFREPORT_COL_BORDER  <- "#c2cede"
+PDFREPORT_COL_TEXT    <- "#1a1a1a"
+PDFREPORT_COL_MUTED   <- "#555555"
 
-```{r, results="asis"}
-cat(report_intro(r))
-```
+# Opens a cairo_pdf device (falls back to the base pdf() device if cairo
+# support isn't available on the server), matching render_wartungsplan_pdf().
+.pdfreport_open_device <- function(file, width, height) {
+  opened <- tryCatch({
+    grDevices::cairo_pdf(file, width = width, height = height, onefile = TRUE)
+    TRUE
+  }, error = function(e) FALSE)
+  if (!opened) grDevices::pdf(file, width = width, height = height)
+  invisible(opened)
+}
 
-# Method comparison
+# Same fix as wartungsplan's fix_uplus(): on a server without a UTF-8
+# locale, characters R can't display get replaced with "<U+00D8>"-style
+# placeholders; this converts them back to the real character.
+.pdfreport_fix_uplus <- function(x) {
+  x <- enc2utf8(as.character(x))
+  m <- regmatches(x, gregexpr("<U\\+[0-9A-Fa-f]{4,6}>", x))
+  for (i in seq_along(x)) {
+    if (!length(m[[i]])) next
+    for (tok in unique(m[[i]])) {
+      cp <- strtoi(substr(tok, 4, nchar(tok) - 1), 16L)
+      ch <- tryCatch(intToUtf8(cp), error = function(e) "")
+      if (nzchar(ch)) x[i] <- gsub(tok, ch, x[i], fixed = TRUE)
+    }
+  }
+  x
+}
 
-```{r, results="asis"}
-cat(report_mc(r$mc))
-```
+# ---- rich-text markup: "**bold**", "++underline++", "- " bullet lines ----
+# Same markup convention the old LaTeX renderer (format_richtext_cell)
+# understood, so text users already typed keeps rendering the same way.
+.pdfreport_parse_richtext <- function(text) {
+  if (is.null(text) || length(text) == 0 || is.na(text) ||
+      !nzchar(trimws(as.character(text))))
+    return(list())
+  text <- .pdfreport_fix_uplus(text)
+  lines <- strsplit(as.character(text), "\n")[[1]]
+  lapply(lines, function(ln) {
+    bullet <- grepl("^- ", ln)
+    if (bullet) ln <- sub("^- ", "", ln)
+    runs <- list()
+    remaining <- ln
+    bold_open <- FALSE
+    underline_open <- FALSE
+    repeat {
+      pb <- regexpr("**", remaining, fixed = TRUE)
+      pu <- regexpr("++", remaining, fixed = TRUE)
+      pb_val <- if (pb > 0) pb else Inf
+      pu_val <- if (pu > 0) pu else Inf
+      if (is.infinite(pb_val) && is.infinite(pu_val)) {
+        if (nzchar(remaining))
+          runs[[length(runs) + 1]] <- list(text = remaining, bold = bold_open, underline = underline_open)
+        break
+      }
+      if (pb_val <= pu_val) {
+        seg <- substr(remaining, 1, pb_val - 1)
+        if (nzchar(seg))
+          runs[[length(runs) + 1]] <- list(text = seg, bold = bold_open, underline = underline_open)
+        bold_open <- !bold_open
+        remaining <- substring(remaining, pb_val + 2)
+      } else {
+        seg <- substr(remaining, 1, pu_val - 1)
+        if (nzchar(seg))
+          runs[[length(runs) + 1]] <- list(text = seg, bold = bold_open, underline = underline_open)
+        underline_open <- !underline_open
+        remaining <- substring(remaining, pu_val + 2)
+      }
+    }
+    list(bullet = bullet, runs = runs)
+  })
+}
 
-```{r, eval=r$mc$ok}
-try(plot1(r$mc$data), silent = TRUE)
-try(plot2(r$mc$data), silent = TRUE)
-```
+.pdfreport_tokenize_runs <- function(runs) {
+  toks <- list()
+  for (r in runs) {
+    words <- strsplit(r$text, " ", fixed = TRUE)[[1]]
+    words <- words[nchar(words) > 0]
+    for (w in words)
+      toks[[length(toks) + 1]] <- list(text = w, bold = r$bold, underline = r$underline)
+  }
+  toks
+}
 
-```{r, results="asis", eval=r$mc$ok}
-cat(report_mc_raw(r$mc))
-```
+# Wraps a flat token list to `avail_w` (in the caller's 0-100 units), using
+# physical-inch text metrics converted through `x_scale` (units per inch).
+.pdfreport_wrap_tokens <- function(tokens, avail_w, cex, x_scale) {
+  if (!length(tokens)) return(list(list()))
+  w_of <- function(txt, font) strwidth(txt, units = "inches", cex = cex, font = font) * x_scale
+  space_w <- w_of(" ", 1)
+  # A single word wider than the column (file name, URL) is broken up, otherwise
+  # it would run into the next column or off the page.
+  split_long <- function(tok) {
+    fnt <- if (isTRUE(tok$bold)) 2 else 1
+    if (w_of(tok$text, fnt) <= avail_w) return(list(tok))
+    parts <- character(0); part <- ""
+    for (ch in strsplit(tok$text, "")[[1]]) {
+      if (nzchar(part) && w_of(paste0(part, ch), fnt) > avail_w) {
+        parts <- c(parts, part); part <- ch
+      } else part <- paste0(part, ch)
+    }
+    lapply(c(parts, part), function(p) { tok$text <- p; tok })
+  }
+  tokens <- unlist(lapply(tokens, split_long), recursive = FALSE)
+  out <- list(); cur <- list(); cur_w <- 0
+  for (tok in tokens) {
+    fnt <- if (isTRUE(tok$bold)) 2 else 1
+    tw <- w_of(tok$text, fnt)
+    add <- tw + if (length(cur)) space_w else 0
+    if (length(cur) && cur_w + add > avail_w) {
+      out[[length(out) + 1]] <- cur
+      cur <- list(tok); cur_w <- tw
+    } else {
+      cur[[length(cur) + 1]] <- tok
+      cur_w <- cur_w + add
+    }
+  }
+  if (length(cur)) out[[length(out) + 1]] <- cur
+  out
+}
 
-# Quality control
+# Lays out a full text cell (possibly multi-line/bulleted) into wrapped
+# visual lines ready to draw. `plain = TRUE` skips **/++ markup parsing
+# (used for the Frage/Antwort columns, which never contain that markup).
+.pdfreport_layout_text <- function(text, avail_w, cex, x_scale, plain = FALSE, bold = FALSE) {
+  text <- if (is.null(text) || (length(text) == 1 && is.na(text))) "" else as.character(text)
+  if (!nzchar(trimws(text))) return(list(list(tokens = list(), indent = 0, bullet = FALSE)))
+  
+  if (plain) {
+    text <- .pdfreport_fix_uplus(text)
+    words <- strsplit(text, "\\s+")[[1]]
+    words <- words[nchar(words) > 0]
+    toks <- lapply(words, function(w) list(text = w, bold = bold, underline = FALSE))
+    wrapped <- .pdfreport_wrap_tokens(toks, avail_w, cex, x_scale)
+    return(lapply(wrapped, function(w) list(tokens = w, indent = 0, bullet = FALSE)))
+  }
+  
+  parsed <- .pdfreport_parse_richtext(text)
+  bullet_indent <- strwidth("•  ", units = "inches", cex = cex) * x_scale
+  out <- list()
+  for (ln in parsed) {
+    toks <- .pdfreport_tokenize_runs(ln$runs)
+    indent <- if (ln$bullet) bullet_indent else 0
+    wrapped <- .pdfreport_wrap_tokens(toks, avail_w - indent, cex, x_scale)
+    if (!length(wrapped)) wrapped <- list(list())
+    for (i in seq_along(wrapped)) {
+      out[[length(out) + 1]] <- list(
+        tokens = wrapped[[i]],
+        indent = indent,
+        bullet = ln$bullet && i == 1
+      )
+    }
+  }
+  if (!length(out)) out <- list(list(tokens = list(), indent = 0, bullet = FALSE))
+  out
+}
 
-```{r, results="asis"}
-cat(report_qc(r$qc))
-```
+# Draws pre-wrapped lines top-down starting at (x0, y_top); returns the y
+# coordinate immediately below the last line drawn.
+.pdfreport_draw_lines <- function(lines, x0, y_top, cex, line_h, x_scale,
+                                  col = PDFREPORT_COL_TEXT, align = "left", width = NULL) {
+  y <- y_top
+  for (ln in lines) {
+    line_w <- 0
+    if (align != "left" && length(ln$tokens)) {
+      for (tok in ln$tokens) {
+        fnt <- if (isTRUE(tok$bold)) 2 else 1
+        line_w <- line_w + strwidth(tok$text, units = "inches", cex = cex, font = fnt) * x_scale
+      }
+      if (length(ln$tokens) > 1)
+        line_w <- line_w + (length(ln$tokens) - 1) * strwidth(" ", units = "inches", cex = cex) * x_scale
+    }
+    x <- x0 + ln$indent
+    if (align == "center" && !is.null(width)) x <- x0 + max(0, (width - line_w) / 2)
+    ty <- y - line_h * 0.5
+    if (isTRUE(ln$bullet)) text(x0, ty, "•", cex = cex, adj = c(0, 0.5), col = col)
+    for (tok in ln$tokens) {
+      fnt <- if (isTRUE(tok$bold)) 2 else 1
+      text(x, ty, tok$text, cex = cex, font = fnt, adj = c(0, 0.5), col = col)
+      tw <- strwidth(tok$text, units = "inches", cex = cex, font = fnt) * x_scale
+      if (isTRUE(tok$underline))
+        segments(x, ty - line_h * 0.32, x + tw, ty - line_h * 0.32, col = col, lwd = 0.6)
+      x <- x + tw + strwidth(" ", units = "inches", cex = cex) * x_scale
+    }
+    y <- y - line_h
+  }
+  y
+}
 
-# Chemicals and software
+# ---- Shared page chrome --------------------------------------------------
+# Every report renderer calls these same three functions, so every PDF the
+# app produces shares the exact same brand header bar, meta block, footer
+# and cover/TOC page - "same format and colour" by construction rather than
+# by each renderer copying the look separately.
+#
+# .pdfreport_draw_header() draws (or, with dry_run = TRUE, just measures)
+# the top brand bar + meta lines + optional section heading, and returns the
+# y coordinate where the page's own content should start - so pagination
+# math (Step 1, below) and actual drawing (Step 2) always agree, even
+# though the header's height varies with how many meta_lines are passed.
+.pdfreport_draw_header <- function(title, report_type, meta_lines, heading = NULL, dry_run = FALSE) {
+  if (!dry_run) {
+    rect(0, 94, 100, 100, col = PDFREPORT_COL_PRIMARY, border = NA)
+    text(2, 97.4, toupper(title), col = "white", cex = 1.15, font = 2, adj = c(0, 0.5))
+    if (nzchar(report_type))
+      text(98, 97.4, report_type, col = "white", cex = 0.72, adj = c(1, 0.5))
+  }
+  
+  y <- 91.5
+  for (ml in meta_lines) {
+    if (!dry_run) text(2, y, ml, cex = 0.62, adj = c(0, 0.5), col = PDFREPORT_COL_MUTED)
+    y <- y - 1.7
+  }
+  divider_y <- y + 0.9
+  if (!dry_run) segments(2, divider_y, 98, divider_y, col = PDFREPORT_COL_ACCENT, lwd = 1.2)
+  
+  heading_y <- divider_y - 2.3
+  if (!is.null(heading) && nzchar(heading)) {
+    if (!dry_run) text(2, heading_y, heading, cex = 0.95, font = 2, col = PDFREPORT_COL_PRIMARY, adj = c(0, 0.5))
+    return(invisible(heading_y - 3))
+  }
+  invisible(divider_y - 2)
+}
 
-```{r, results="asis"}
-cat(report_chem(r$chem))
-```
+.pdfreport_draw_footer <- function(footer_text, pg_idx, n_pages, x_left = 4, x_right = 96) {
+  if (nzchar(footer_text)) text(x_left, 1.4, footer_text, cex = 0.5, adj = c(0, 0.5), col = PDFREPORT_COL_MUTED)
+  text(x_right, 1.4, sprintf("Page %d of %d", pg_idx, n_pages), cex = 0.5, adj = c(1, 0.5), col = PDFREPORT_COL_MUTED)
+}
 
-```{r, results="asis"}
-cat(report_attachments(r$docs))
-```
-'
-)
+# Draws the report's page 1: project title, an optional confidentiality/
+# consent paragraph, and an "Inhalt" table of contents (heading + page
+# number per section) - built from the page plan every renderer already
+# computes, so the page numbers are always exactly right.
+
+# ---- Cover / "Inhalt" (table of contents) pages --------------------------
+# Packs the title, the confidentiality/consent paragraph and a (possibly
+# multi-level, dot-leadered) table of contents into one or more cover
+# pages - a long or nested TOC now flows onto extra pages instead of
+# running off the bottom of a single one. `toc_entries` is a list of
+# list(text = "...", page = <int>, level = 1|2|3); level 1 is bold with no
+# leader (a top-level "N. Heading"), levels 2/3 are indented with a dotted
+# leader to the page number (matching a normal LaTeX/Word table of
+# contents).
+.pdfreport_build_cover_pages <- function(project_title, intro_lines, toc_entries,
+                                         cex_body, line_h, x_scale, avail_h,
+                                         x_left = 4, x_right = 96) {
+  content_w <- x_right - x_left
+  units <- list()
+  
+  if (nzchar(project_title))
+    units[[length(units) + 1]] <- list(kind = "cover_title", height = line_h * 2.2)
+  
+  for (para in intro_lines) {
+    lines <- .pdfreport_layout_text(para, content_w, cex_body, x_scale, plain = TRUE)
+    for (ln in lines) units[[length(units) + 1]] <- list(kind = "text_line", line = ln, height = line_h)
+    units[[length(units) + 1]] <- list(kind = "gap", height = line_h * 0.5)
+  }
+  if (length(intro_lines)) units[[length(units) + 1]] <- list(kind = "gap", height = line_h * 1.4)
+  
+  if (length(toc_entries)) {
+    units[[length(units) + 1]] <- list(kind = "toc_heading", height = line_h * 2.2)
+    for (entry in toc_entries) {
+      lvl <- if (!is.null(entry$level)) entry$level else 1
+      h <- if (lvl >= 3) line_h * 1.5 else if (lvl == 2) line_h * 1.6 else line_h * 1.9
+      units[[length(units) + 1]] <- list(kind = "toc_entry", entry = entry, height = h)
+    }
+  }
+  
+  pages <- list(); cur <- list(); cur_h <- 0
+  flush <- function() {
+    if (!length(cur)) return(invisible(NULL))
+    pages[[length(pages) + 1]] <<- cur
+    cur <<- list(); cur_h <<- 0
+  }
+  for (u in units) {
+    if (length(cur) && cur_h + u$height > avail_h) flush()
+    cur[[length(cur) + 1]] <- u
+    cur_h <- cur_h + u$height
+  }
+  flush()
+  if (!length(pages)) pages <- list(list())
+  pages
+}
+
+.pdfreport_draw_cover_page <- function(items, project_title, y_start, cex_body, line_h, x_scale,
+                                       x_left = 4, x_right = 96) {
+  y <- y_start
+  for (item in items) {
+    if (identical(item$kind, "cover_title")) {
+      text(50, y - line_h, project_title, cex = 1.25, font = 2, col = PDFREPORT_COL_PRIMARY, adj = c(0.5, 0.5))
+      y <- y - item$height
+    } else if (identical(item$kind, "text_line")) {
+      y <- .pdfreport_draw_lines(list(item$line), x_left, y, cex_body, line_h, x_scale)
+    } else if (identical(item$kind, "gap")) {
+      y <- y - item$height
+    } else if (identical(item$kind, "toc_heading")) {
+      text(x_left, y - line_h * 0.9, "Contents", cex = 1.0, font = 2, col = PDFREPORT_COL_PRIMARY, adj = c(0, 0.5))
+      segments(x_left, y - line_h * 1.7, x_right, y - line_h * 1.7, col = PDFREPORT_COL_ACCENT, lwd = 0.8)
+      y <- y - item$height
+    } else if (identical(item$kind, "toc_entry")) {
+      entry <- item$entry
+      lvl <- if (!is.null(entry$level)) entry$level else 1
+      indent <- (lvl - 1) * 3.5
+      cex_e <- if (lvl == 1) 0.78 else if (lvl == 2) 0.72 else 0.66
+      font_e <- if (lvl == 1) 2 else 1
+      col_e <- if (lvl == 1) PDFREPORT_COL_PRIMARY else PDFREPORT_COL_TEXT
+      ty <- y - item$height * 0.55
+      text(x_left + indent, ty, entry$text, cex = cex_e, font = font_e, col = col_e, adj = c(0, 0.5))
+      page_str <- as.character(entry$page)
+      pw <- strwidth(page_str, units = "inches", cex = cex_e) * x_scale
+      text(x_right, ty, page_str, cex = cex_e, adj = c(1, 0.5), col = PDFREPORT_COL_MUTED)
+      if (lvl > 1) {
+        text_w <- strwidth(entry$text, units = "inches", cex = cex_e, font = font_e) * x_scale
+        x1 <- x_left + indent + text_w + 1
+        x2 <- x_right - pw - 1.5
+        if (x2 > x1) segments(x1, ty - 0.1, x2, ty - 0.1, col = PDFREPORT_COL_BORDER, lwd = 0.5, lty = 3)
+      }
+      y <- y - item$height
+    }
+  }
+  invisible(y)
+}
+
+# Lays out one N-column table's rows (generalizes the Frage/Antwort/
+# Begruendung row model in render_qa_report_pdf to arbitrary columns).
+.pdfreport_layout_table <- function(columns, data, cex, x_scale, x_left, x_right, line_h, row_pad) {
+  content_w <- x_right - x_left
+  gap <- 1.2
+  x <- x_left
+  for (i in seq_along(columns)) {
+    columns[[i]]$x <- x
+    columns[[i]]$w <- content_w * columns[[i]]$width
+    x <- x + columns[[i]]$w
+  }
+  
+  n <- if (is.null(data) || !nrow(data)) 0 else nrow(data)
+  rows <- lapply(seq_len(n), function(i) {
+    cells <- lapply(columns, function(col) {
+      val <- if (col$field %in% names(data)) data[[col$field]][i] else ""
+      .pdfreport_layout_text(val, col$w - gap, cex, x_scale, plain = !isTRUE(col$richtext))
+    })
+    n_lines <- max(1, vapply(cells, length, integer(1)))
+    list(cells = cells, height = n_lines * line_h + row_pad)
+  })
+  
+  list(columns = columns, header_h = line_h + row_pad * 1.4, rows = rows, gap = gap)
+}
+
+# Splits ONE table row that is taller than a whole page into several chunks
+# (line by line, all cells in parallel), so long free-text cells continue on the
+# next page instead of being drawn past the bottom edge and cut off.
+# first_avail = height available for the first chunk on the current page,
+# page_avail  = height available for each following chunk (a fresh page).
+.pdfreport_split_row <- function(row, line_h, row_pad, first_avail, page_avail) {
+  n_total <- max(1L, vapply(row$cells, length, integer(1)))
+  chunks <- list(); pos <- 0L; avail <- first_avail
+  while (pos < n_total) {
+    cap  <- max(1L, floor((avail - row_pad) / line_h))
+    take <- min(cap, n_total - pos)
+    cells <- lapply(row$cells, function(cl) {
+      if (length(cl) > pos) cl[(pos + 1L):min(length(cl), pos + take)] else cl[0]
+    })
+    chunks[[length(chunks) + 1L]] <- list(cells = cells, height = take * line_h + row_pad)
+    pos   <- pos + take
+    avail <- page_avail
+  }
+  chunks
+}
+
+.pdfreport_draw_table_header <- function(tbl, x_left, x_right, y_cursor, cex_hdr = 0.66) {
+  rect(x_left, y_cursor - tbl$header_h, x_right, y_cursor, col = PDFREPORT_COL_PRIMARY, border = NA)
+  for (col in tbl$columns) {
+    adj <- if (identical(col$align, "center")) c(0.5, 0.5) else if (identical(col$align, "right")) c(1, 0.5) else c(0, 0.5)
+    tx <- if (identical(col$align, "center")) col$x + col$w / 2
+    else if (identical(col$align, "right")) col$x + col$w - tbl$gap / 2
+    else col$x + tbl$gap / 2
+    text(tx, y_cursor - tbl$header_h / 2, col$label, col = "white", cex = cex_hdr, font = 2, adj = adj)
+  }
+  y_cursor - tbl$header_h
+}
+
+.pdfreport_draw_table_row <- function(tbl, row, x_left, x_right, y_cursor, cex, line_h, x_scale, shade) {
+  yb <- y_cursor - row$height
+  fill <- if (shade) PDFREPORT_COL_ROW_ALT else "white"
+  rect(x_left, yb, x_right, y_cursor, col = fill, border = PDFREPORT_COL_BORDER, lwd = 0.35)
+  # Vertically center each cell's wrapped lines within the row's full
+  # height (row$height already includes the generous row_pad margin), so
+  # text starts with real breathing room instead of right against the top
+  # border - and a short cell (e.g. "Antwort") sits centered rather than
+  # stuck to the top next to a much taller neighboring cell.
+  for (i in seq_along(tbl$columns)) {
+    col <- tbl$columns[[i]]
+    if (i > 1) segments(col$x, yb, col$x, y_cursor, col = PDFREPORT_COL_BORDER, lwd = 0.3)
+    align <- if (identical(col$align, "center")) "center" else "left"
+    x0 <- if (align == "center") col$x else col$x + tbl$gap / 2
+    n_lines_i <- max(1, length(row$cells[[i]]))
+    cell_top <- y_cursor - max(0, (row$height - n_lines_i * line_h) / 2)
+    .pdfreport_draw_lines(row$cells[[i]], x0, cell_top, cex, line_h, x_scale,
+                          align = align, width = col$w)
+  }
+  yb
+}
+
+render_flex_report_pdf <- function(file, title, report_type = "", project_title = "",
+                                   meta_lines = character(0), sections, footer_text = "",
+                                   intro_lines = character(0)) {
+  
+  old_lc <- Sys.getlocale("LC_CTYPE")
+  suppressWarnings(tryCatch(Sys.setlocale("LC_CTYPE", "de_DE.UTF-8"), error = function(e) NULL))
+  if (Sys.getlocale("LC_CTYPE") %in% c("C", "POSIX"))
+    suppressWarnings(tryCatch(Sys.setlocale("LC_CTYPE", "C.UTF-8"), error = function(e) NULL))
+  on.exit(suppressWarnings(try(Sys.setlocale("LC_CTYPE", old_lc), silent = TRUE)), add = TRUE)
+  
+  pw <- 8.27; ph <- 11.69  # A4 portrait, inches
+  .pdfreport_open_device(file, pw, ph)
+  on.exit(try(dev.off(), silent = TRUE), add = TRUE)
+  
+  x_scale <- 100 / pw
+  y_scale <- 100 / ph
+  png_available <- requireNamespace("png", quietly = TRUE)
+  all_meta <- if (nzchar(project_title)) c(paste0("Project: ", project_title), meta_lines) else meta_lines
+  
+  x_left <- 4; x_right <- 96
+  content_w <- x_right - x_left
+  
+  cex_body <- 0.68
+  # ✅ Same generous spacing as render_qa_report_pdf() - a tight line_h let
+  # the last line of a wrapped cell run past its row's bottom edge, where
+  # the next row's/item's background painted over it ("cut off" text).
+  line_h <- strheight("Mg", units = "inches", cex = cex_body) * y_scale * 2.4
+  row_pad <- line_h * 0.8
+  
+  y_top <- .pdfreport_draw_header(title, report_type, all_meta, heading = "X", dry_run = TRUE)
+  foot_reserve <- 7
+  avail_h <- y_top - foot_reserve
+  
+  # ---- Step 1: turn every section's pieces into a flat sequence of
+  # "flow units" (a whole block, or one table header / one table row), then
+  # greedily pack them into pages. ----
+  page_plan <- list()
+  for (sec in sections) {
+    # A section with reserve_pages = k only reserves k blank placeholder pages
+    # (own heading + entry in the Inhalt). The caller later swaps them for the
+    # pages of an external PDF (e.g. the Organigramm) with
+    # pdfreport_splice_pdf(), so page numbers in the Inhalt and in the footers
+    # stay correct. The finished file carries attr "reserved_pages".
+    if (!is.null(sec$reserve_pages) && sec$reserve_pages > 0) {
+      for (j in seq_len(sec$reserve_pages)) {
+        page_plan[[length(page_plan) + 1]] <- list(
+          heading = sec$heading, continuation = j > 1, items = list(),
+          toc_level = if (!is.null(sec$toc_level)) sec$toc_level else 1,
+          toc_parent = sec$toc_parent, reserved = TRUE
+        )
+      }
+      next
+    }
+    flow <- list()
+    for (piece in sec$pieces) {
+      if (identical(piece$type, "kv")) {
+        for (item in piece$items) {
+          txt <- paste0("**", item$label, ":** ", if (nzchar(trimws(as.character(item$value)))) item$value else "–")
+          lines <- .pdfreport_layout_text(txt, content_w, cex_body, x_scale, plain = FALSE)
+          flow[[length(flow) + 1]] <- list(kind = "text_para", lines = lines)
+        }
+      } else if (identical(piece$type, "text")) {
+        for (para in piece$text) {
+          if (!nzchar(trimws(para))) next
+          lines <- .pdfreport_layout_text(para, content_w, cex_body, x_scale, plain = FALSE)
+          flow[[length(flow) + 1]] <- list(kind = "text_para", lines = lines)
+        }
+      } else if (identical(piece$type, "image")) {
+        files <- Filter(function(f) !is.null(f) && file.exists(f), piece$files)
+        if (length(files) && png_available)
+          flow[[length(flow) + 1]] <- list(kind = "image", files = files, height = 42)
+      } else if (identical(piece$type, "table")) {
+        tbl <- .pdfreport_layout_table(piece$columns, piece$data, cex_body, x_scale,
+                                       x_left, x_right, line_h, row_pad)
+        flow[[length(flow) + 1]] <- list(kind = "table", tbl = tbl)
+      } else if (identical(piece$type, "heading")) {
+        # A sub-heading *within* a section's flowing content (does not
+        # force a page break by itself) - e.g. "Grundlagen und
+        # Organisation" under "3. Laborinformationen", or "5.1.1 Staerken"
+        # under "5. Auswertungen". Recorded into the Inhalt page as a
+        # nested (levels 2/3) entry at whatever page it actually lands on.
+        lvl <- if (!is.null(piece$level)) piece$level else 2
+        flow[[length(flow) + 1]] <- list(kind = "heading_block", text = piece$text, level = lvl,
+                                         height = line_h * 1.9)
+      }
+    }
+    
+    cur_items <- list(); cur_h <- 0; first_chunk <- TRUE; produced_any_page <- FALSE
+    flush_page <- function(force_empty = FALSE) {
+      if (!length(cur_items) && !force_empty) return(invisible(NULL))
+      page_plan[[length(page_plan) + 1]] <<- list(
+        heading = sec$heading, continuation = !first_chunk, items = cur_items,
+        toc_level = if (!is.null(sec$toc_level)) sec$toc_level else 1,
+        toc_parent = sec$toc_parent
+      )
+      produced_any_page <<- TRUE
+      first_chunk <<- FALSE
+      cur_items <<- list(); cur_h <<- 0
+    }
+    
+    for (unit in flow) {
+      if (unit$kind == "text_para") {
+        # Split long paragraphs (Best Practices, Massnahmen, ...) line by
+        # line, the same way table rows already flow across pages - a
+        # paragraph taller than one page used to just get drawn past the
+        # bottom margin instead of continuing onto the next page.
+        for (ln in unit$lines) {
+          if (length(cur_items) && cur_h + line_h > avail_h) flush_page()
+          cur_items[[length(cur_items) + 1]] <- list(kind = "text_line", line = ln)
+          cur_h <- cur_h + line_h
+        }
+        gap_h <- row_pad * 0.5
+        cur_items[[length(cur_items) + 1]] <- list(kind = "gap", height = gap_h)
+        cur_h <- cur_h + gap_h
+      } else if (unit$kind %in% c("image", "heading_block")) {
+        if (length(cur_items) && cur_h + unit$height > avail_h) flush_page()
+        cur_items[[length(cur_items) + 1]] <- unit
+        cur_h <- cur_h + unit$height
+      } else if (unit$kind == "table") {
+        tbl <- unit$tbl
+        if (length(cur_items) && cur_h + tbl$header_h > avail_h) flush_page()
+        cur_items[[length(cur_items) + 1]] <- list(kind = "table_header", tbl = tbl)
+        cur_h <- cur_h + tbl$header_h
+        if (!length(tbl$rows)) {
+          cur_items[[length(cur_items) + 1]] <- list(kind = "table_empty", tbl = tbl, height = line_h + row_pad)
+          cur_h <- cur_h + line_h + row_pad
+        }
+        for (ri in seq_along(tbl$rows)) {
+          rp <- tbl$rows[[ri]]
+          page_cap <- avail_h - tbl$header_h
+
+          if (rp$height > page_cap) {
+            # This single row is taller than a whole page (e.g. a question with
+            # many long comments in one cell). Drawn as one block it ran past
+            # the bottom margin and the end of the text was cut off, so it is
+            # split line by line across as many pages as needed - the table
+            # header is repeated on every page.
+            first_avail <- avail_h - cur_h
+            if (first_avail < row_pad + 4 * line_h) {
+              # too little room left for even a few lines: start on a fresh page
+              if (length(cur_items) && identical(cur_items[[length(cur_items)]]$kind, "table_header")) {
+                cur_items[[length(cur_items)]] <- NULL   # don't leave a header alone
+                cur_h <- cur_h - tbl$header_h
+              }
+              if (length(cur_items)) flush_page()
+              cur_items[[length(cur_items) + 1]] <- list(kind = "table_header", tbl = tbl)
+              cur_h <- tbl$header_h
+              first_avail <- avail_h - cur_h
+            }
+            chunks <- .pdfreport_split_row(rp, line_h, row_pad, first_avail, page_cap)
+            for (ci in seq_along(chunks)) {
+              if (ci > 1) {
+                flush_page()
+                cur_items[[length(cur_items) + 1]] <- list(kind = "table_header", tbl = tbl)
+                cur_h <- tbl$header_h
+              }
+              cur_items[[length(cur_items) + 1]] <- list(kind = "table_row", tbl = tbl, row = chunks[[ci]], shade = (ri %% 2 == 0))
+              cur_h <- cur_h + chunks[[ci]]$height
+            }
+            next
+          }
+
+          if (cur_h + rp$height > avail_h) {
+            flush_page()
+            cur_items[[length(cur_items) + 1]] <- list(kind = "table_header", tbl = tbl)
+            cur_h <- tbl$header_h
+          }
+          cur_items[[length(cur_items) + 1]] <- list(kind = "table_row", tbl = tbl, row = rp, shade = (ri %% 2 == 0))
+          cur_h <- cur_h + rp$height
+        }
+      }
+    }
+    flush_page(force_empty = !produced_any_page)
+  }
+  
+  # Build the (possibly 3-level) Inhalt list: a real entry for every
+  # section's own heading (at that section's toc_level), a synthetic
+  # "virtual parent" entry the first time a toc_parent label is seen
+  # (sharing its child's page number - it has no page of its own, e.g.
+  # "4. Vergleich Selbst- und Fremdbewertung" pointing at the same page as
+  # "4.1 Fuehrung"), and one nested entry per "heading" piece encountered
+  # on that page (in document order).
+  toc_entries <- list()
+  seen_parents <- character(0)
+  for (idx in seq_along(page_plan)) {
+    pg <- page_plan[[idx]]
+    if (!isTRUE(pg$continuation)) {
+      if (!is.null(pg$toc_parent) && !(pg$toc_parent %in% seen_parents)) {
+        toc_entries[[length(toc_entries) + 1]] <- list(text = pg$toc_parent, page = idx, level = 1)
+        seen_parents <- c(seen_parents, pg$toc_parent)
+      }
+      lvl <- if (!is.null(pg$toc_level)) pg$toc_level else 1
+      toc_entries[[length(toc_entries) + 1]] <- list(text = pg$heading, page = idx, level = lvl)
+    }
+    for (item in pg$items) {
+      if (identical(item$kind, "heading_block"))
+        toc_entries[[length(toc_entries) + 1]] <- list(text = item$text, page = idx, level = item$level)
+    }
+  }
+  n_cover <- length(.pdfreport_build_cover_pages(project_title, intro_lines, toc_entries, cex_body, line_h, x_scale, avail_h))
+  toc_entries <- lapply(toc_entries, function(e) { e$page <- e$page + n_cover; e })
+  cover_pages <- .pdfreport_build_cover_pages(project_title, intro_lines, toc_entries, cex_body, line_h, x_scale, avail_h)
+  page_plan <- c(lapply(cover_pages, function(items) list(type = "cover", items = items)), page_plan)
+  n_pages <- length(page_plan)
+  
+  # ---- Step 2: draw every planned page. ----
+  for (pg_idx in seq_along(page_plan)) {
+    pg <- page_plan[[pg_idx]]
+    par(mar = c(0, 0, 0, 0), oma = c(0, 0, 0, 0))
+    plot.new(); plot.window(xlim = c(0, 100), ylim = c(0, 100), xaxs = "i", yaxs = "i")
+    
+    if (identical(pg$type, "cover")) {
+      y0 <- .pdfreport_draw_header(title, report_type, all_meta, heading = NULL)
+      .pdfreport_draw_cover_page(pg$items, project_title, y0, cex_body, line_h, x_scale)
+      .pdfreport_draw_footer(footer_text, pg_idx, n_pages)
+      next
+    }
+    
+    hd <- pg$heading
+    if (isTRUE(pg$continuation)) hd <- paste0(hd, " (continued)")
+    .pdfreport_draw_header(title, report_type, all_meta, heading = hd)
+
+    if (isTRUE(pg$reserved)) {
+      # Placeholder for an external PDF; normally replaced afterwards. Only
+      # visible if that replacement failed.
+      text(50, 55, "The file could not be attached.", cex = 0.8, font = 3, col = PDFREPORT_COL_MUTED)
+      .pdfreport_draw_footer(footer_text, pg_idx, n_pages)
+      next
+    }
+
+    y_cursor <- y_top
+    for (item in pg$items) {
+      if (identical(item$kind, "text_line")) {
+        y_cursor <- .pdfreport_draw_lines(list(item$line), x_left, y_cursor, cex_body, line_h, x_scale)
+      } else if (identical(item$kind, "gap")) {
+        y_cursor <- y_cursor - item$height
+      } else if (identical(item$kind, "heading_block")) {
+        indent <- (item$level - 2) * 2
+        cex_h <- if (item$level >= 3) 0.72 else 0.82
+        col_h <- if (item$level >= 3) PDFREPORT_COL_ACCENT else PDFREPORT_COL_PRIMARY
+        text(x_left + indent, y_cursor - item$height * 0.55, item$text, cex = cex_h, font = 2, col = col_h, adj = c(0, 0.5))
+        y_cursor <- y_cursor - item$height
+      } else if (identical(item$kind, "image")) {
+        n_img <- length(item$files)
+        slot_w <- (content_w - (n_img - 1) * 2) / n_img
+        for (i in seq_along(item$files)) {
+          img <- tryCatch(png::readPNG(item$files[i]), error = function(e) NULL)
+          if (is.null(img)) next
+          img_dim <- dim(img)
+          asp <- img_dim[1] / img_dim[2]
+          img_w <- min(slot_w, 55)
+          img_h <- min(img_w * asp * (y_scale / x_scale), 40)
+          x0 <- x_left + (i - 1) * (slot_w + 2) + (slot_w - img_w) / 2
+          rasterImage(img, x0, y_cursor - img_h, x0 + img_w, y_cursor)
+        }
+        y_cursor <- y_cursor - item$height
+      } else if (identical(item$kind, "table_header")) {
+        y_cursor <- .pdfreport_draw_table_header(item$tbl, x_left, x_right, y_cursor)
+      } else if (identical(item$kind, "table_empty")) {
+        rect(x_left, y_cursor - item$height, x_right, y_cursor, col = "white", border = PDFREPORT_COL_BORDER, lwd = 0.4)
+        text((x_left + x_right) / 2, y_cursor - item$height / 2, "No data available.",
+             cex = 0.65, font = 3, col = PDFREPORT_COL_MUTED)
+        y_cursor <- y_cursor - item$height
+      } else if (identical(item$kind, "table_row")) {
+        y_cursor <- .pdfreport_draw_table_row(item$tbl, item$row, x_left, x_right, y_cursor,
+                                              cex_body, line_h, x_scale, item$shade)
+      }
+    }
+    
+    .pdfreport_draw_footer(footer_text, pg_idx, n_pages)
+  }
+
+  # Which finished pages are placeholders (see sec$reserve_pages above).
+  out_file <- file
+  attr(out_file, "reserved_pages") <- which(vapply(page_plan, function(p) isTRUE(p$reserved), logical(1)))
+  invisible(out_file)
+}
+
+# Replaces the placeholder pages `reserved` (consecutive page numbers) of
+# `main_pdf` with ALL pages of `insert_pdf`, writing `out_pdf`. The engine
+# reserves exactly as many placeholders as insert_pdf has pages, so the total
+# page count - and therefore the Inhalt and the "Seite x von N" footers - stay
+# correct. Returns out_pdf, or main_pdf unchanged if anything goes wrong.
+pdfreport_splice_pdf <- function(main_pdf, insert_pdf, reserved, out_pdf) {
+  tryCatch({
+    reserved <- sort(unique(as.integer(reserved)))
+    n <- pdftools::pdf_length(main_pdf)
+    first <- min(reserved); last <- max(reserved)
+    parts <- character(0)
+    if (first > 1) {
+      f1 <- tempfile(fileext = ".pdf")
+      pdftools::pdf_subset(main_pdf, pages = seq_len(first - 1), output = f1)
+      parts <- c(parts, f1)
+    }
+    parts <- c(parts, insert_pdf)
+    if (last < n) {
+      f3 <- tempfile(fileext = ".pdf")
+      pdftools::pdf_subset(main_pdf, pages = (last + 1):n, output = f3)
+      parts <- c(parts, f3)
+    }
+    pdftools::pdf_combine(input = parts, output = out_pdf)
+    if (file.exists(out_pdf) && file.size(out_pdf) > 0) out_pdf else main_pdf
+  }, error = function(e) {
+    message("Attaching the PDF failed: ", conditionMessage(e))
+    main_pdf
+  })
+}
 
 #-----------------------------------------------------------------------------------
-# PDF report helpers
+# IVDCheckR report content (drawn by the report engine above)
 
-# LaTeX preamble of the report; only uses what the default pandoc template already loads
-report_preamble <- function(project) {
-  c("\\usepackage{xcolor}",
-    "\\definecolor{ivdblue}{HTML}{40668D}",
-    "\\definecolor{ivddark}{HTML}{00406B}",
-    "\\renewcommand{\\familydefault}{\\sfdefault}",
-    "\\setlength{\\parindent}{0pt}",
-    "\\setlength{\\parskip}{.5em}",
-    "\\AtBeginDocument{\\setlength{\\LTleft}{0pt}\\setlength{\\LTright}{\\fill}}",
-    # characters pdflatex does not know by itself
-    "\\DeclareUnicodeCharacter{2264}{\\ensuremath{\\leq}}",
-    "\\DeclareUnicodeCharacter{2265}{\\ensuremath{\\geq}}",
-    "\\DeclareUnicodeCharacter{2260}{\\ensuremath{\\neq}}",
-    "\\DeclareUnicodeCharacter{2192}{\\ensuremath{\\rightarrow}}",
-    "\\DeclareUnicodeCharacter{2212}{\\ensuremath{-}}",
-    "\\DeclareUnicodeCharacter{03B1}{\\ensuremath{\\alpha}}",
-    "\\DeclareUnicodeCharacter{03B2}{\\ensuremath{\\beta}}",
-    "\\DeclareUnicodeCharacter{03B3}{\\ensuremath{\\gamma}}",
-    "\\DeclareUnicodeCharacter{03BC}{\\ensuremath{\\mu}}",
-    "\\makeatletter",
-    "\\newcommand{\\needroom}[1]{\\par\\begingroup\\dimen@=\\pagegoal\\advance\\dimen@ by -\\pagetotal\\ifdim\\dimen@<#1\\relax\\newpage\\fi\\endgroup}",
-    "\\renewcommand\\section{\\@startsection{section}{1}{0pt}{1.6em}{.7em}{\\normalfont\\Large\\bfseries\\color{ivddark}}}",
-    "\\renewcommand\\subsection{\\@startsection{subsection}{2}{0pt}{1em}{.2em}{\\normalfont\\normalsize\\bfseries\\color{ivdblue}}}",
-    "\\def\\ps@ivdreport{\\def\\@oddhead{}\\def\\@evenhead{}",
-    paste0("  \\def\\@oddfoot{\\footnotesize\\color{gray}IVDCheckR report", if (nzchar(project)) paste0(" -- ", tex_text(project)),
-           "\\hfill Page \\thepage}\\let\\@evenfoot\\@oddfoot}"),
-    "\\makeatother",
-    "\\pagestyle{ivdreport}")
+# Free text for a "label: value" line; empty fields are marked
+report_value <- function(x, empty = "Not provided") {
+  x <- paste(as.character(x), collapse = ", ")
+  x <- gsub("\t", " ", gsub("\r", "", x, fixed = TRUE), fixed = TRUE)
+  if (is.na(x) || !nzchar(trimws(x))) empty else trimws(x)
 }
 
-# Replace everything pdflatex cannot print, so unusual input can never break the download
-report_chars <- function(x) {
-  x <- paste(as.character(x), collapse = " ")
-  if (is.na(x) || !nzchar(x)) return("")
-  u <- utf8ToInt(enc2utf8(x))
-  if (anyNA(u)) return(iconv(x, to = "ASCII", sub = "?"))
-  u <- u[u != 13L]
-  u[u == 9L] <- 32L
-  known <- c(0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2026, 0x2022, 0x2264, 0x2265, 0x2260, 0x2192, 0x2212, 0x3B1, 0x3B2, 0x3B3, 0x3BC)
-  u[!(u == 10L | (u >= 32L & u < 127L) | (u >= 160L & u < 256L) | u %in% known)] <- 63L
-  if (length(u)) intToUtf8(u) else ""
-}
+report_kv <- function(...) list(type = "kv", items = list(...))
+report_field <- function(label, value, empty = "Not provided") list(label = label, value = report_value(value, empty))
 
-# User text as literal markdown: all ASCII punctuation is escaped
-md_escape <- function(x) gsub("([!-/:-@\\[-`{-~])", "\\\\\\1", report_chars(x), perl = TRUE)
-
-# Free text for the report: line breaks are kept, empty fields are marked
-md_text <- function(x, empty = "*Not provided*") {
-  x <- trimws(report_chars(x))
-  if (!nzchar(x)) return(empty)
-  lines <- trimws(strsplit(x, "\n", fixed = TRUE)[[1]])
-  gsub("  \n  \n", "\n\n", paste0(vapply(lines, md_escape, ""), collapse = "  \n"), fixed = TRUE)
-}
-
-md_table <- function(d, align = NULL, widths = NULL) {
-  cells <- as.data.frame(lapply(d, function(col) vapply(col, function(v) trimws(gsub("\n", " ", md_escape(v), fixed = TRUE)), "", USE.NAMES = FALSE)),
-                         stringsAsFactors = FALSE)
-  colnames(cells) <- vapply(colnames(d), md_escape, "", USE.NAMES = FALSE)
-  lines <- knitr::kable(cells, format = "pipe", align = align)
-  # the dashes set the relative column widths when a table has to wrap
-  if (!is.null(widths)) lines[2] <- paste0("|", paste0(":", strrep("-", widths), collapse = "|"), "|")
-  paste0("\n\n", paste(lines, collapse = "\n"), "\n\n")
-}
-
-tex_text <- function(x) {
-  x <- gsub("\n", " ", report_chars(x), fixed = TRUE)
-  x <- gsub("([{}$&#_%])", "\\\\\\1", gsub("\\", "\001", x, fixed = TRUE), perl = TRUE)
-  x <- gsub("^", "\\^{}", gsub("~", "\\~{}", x, fixed = TRUE), fixed = TRUE)
-  gsub("\001", "\\textbackslash{}", x, fixed = TRUE)
-}
-
-report_section <- function(title, ...) paste(c("\\needroom{3cm}", paste("#", title), ...), collapse = "\n\n")
-report_item <- function(title, text) paste0("## ", md_escape(title), "\n\n", text)
-
-report_intro <- function(r) {
-  title <- if (nzchar(r$title)) r$title else "Untitled project"
-  band <- c("```{=latex}",
-            "\\noindent\\colorbox{ivdblue}{\\parbox{\\dimexpr\\textwidth-2\\fboxsep\\relax}{\\color{white}\\vspace{.7em}",
-            "{\\small\\bfseries IVDCheckR REPORT}\\\\[.5em]",
-            sprintf("{\\LARGE\\bfseries %s}\\\\[.6em]", tex_text(title)),
-            "{\\small Documentation of a laboratory developed test according to Article 5 (5) of the EU-IVDR (EU) 2017/746}\\\\[.3em]",
-            sprintf("{\\small Evaluation period: %s \\quad Report created: %s}\\vspace{.7em}}}", tex_text(r$period), tex_text(r$created)),
-            "```")
-
-  n_doc <- sum(vapply(r$docs, function(d) d$provided, TRUE))
-  n_na <- sum(vapply(r$docs, function(d) !d$applicable, TRUE))
-  n_pdf <- sum(vapply(r$docs, function(d) !is.null(d$file), TRUE))
-  n_filled <- sum(vapply(r$items, function(i) nzchar(trimws(report_chars(i$value))), TRUE))
-  overview <- data.frame(
-    Section = c("Project and measurand (items 1-8)", "IVDR documentation (items 9-15)", "Method comparison", "Quality control",
-                "Chemicals and software", "Attached PDF documents"),
-    Status = c(sprintf("%d of %d items completed", n_filled, length(r$items)),
-               sprintf("%d provided, %d not applicable, %d open", n_doc, n_na, length(r$docs) - n_doc - n_na),
-               if (r$mc$ok) sprintf("%d value pairs", nrow(r$mc$data)) else "No data entered",
-               if (r$qc$ok) sprintf("%d QC level(s)", ncol(r$qc$results) - 1L) else "No data entered",
-               if (nrow(r$chem)) sprintf("%d entries", nrow(r$chem)) else "None listed",
-               if (n_pdf) sprintf("%d, appended after this report", n_pdf) else "None"),
-    check.names = FALSE)
-
-  paste(c(paste(band, collapse = "\n"),
-          report_section("Overview", md_table(overview)),
-          report_section("Project and measurand",
-                         vapply(r$items, function(i) report_item(i$label, md_text(i$value)), "")),
-          report_section("IVDR documentation",
-                         vapply(r$docs, function(d) {
-                           body <- if (!d$applicable) "*Not applicable*" else c(
-                             if (nzchar(trimws(report_chars(d$text)))) md_text(d$text),
-                             if (!is.null(d$file)) paste0("Attached PDF: ", md_escape(d$file$name)),
-                             if (!d$provided) "*Marked as applicable, but nothing was provided*")
-                           report_item(d$title, paste(body, collapse = "\n\n"))
-                         }, "")),
-          report_section("Further comments", md_text(r$extra, "*None*"))),
-        collapse = "\n\n")
-}
-
-report_mc <- function(mc) {
-  if (!mc$ok) return(paste0("*", mc$msg, "*"))
-  paste0(md_table(mc$info, align = "ll"), md_table(mc$summary, align = "lrrr"))
-}
-
-report_mc_raw <- function(mc) {
-  paste0("\\needroom{7cm}\n\n## Raw data\n\n", md_table(mc$raw, align = "rrr"))
-}
-
-report_qc <- function(qc) {
-  if (!qc$ok) return("*No data entered (optional step).*")
-  paste0(md_table(qc$info, align = "ll"),
-         "## Results\n\n", md_table(qc$results, align = c("l", rep("r", ncol(qc$results) - 1L))),
-         if (qc$no_target) "*Bias and RMSD need a target value above 0.*\n\n",
-         "\\needroom{11cm}\n\n## Raw data\n\n", md_table(qc$raw, align = rep("r", ncol(qc$raw))))
-}
-
-report_chem <- function(chem) {
-  if (!nrow(chem)) return("*None listed.*")
-  colnames(chem) <- gsub("/", " / ", colnames(chem), fixed = TRUE)  # lets the long header wrap
-  md_table(chem, widths = c(22, 20, 14, 28, 16))
-}
-
-report_attachments <- function(docs) {
-  files <- Filter(function(d) !is.null(d$file), docs)
-  if (!length(files)) return("")
-  d <- data.frame(Item = vapply(files, function(f) f$title, ""), File = vapply(files, function(f) f$file$name, ""), check.names = FALSE)
-  paste0("# Attached PDF documents\n\nThe following documents are appended after this page, in this order.", md_table(d))
+# Table piece; `widths` are fractions of the page width and should sum to 1
+report_table <- function(d, widths = rep(1 / ncol(d), ncol(d)), align = "center") {
+  align <- rep_len(align, ncol(d))
+  list(type = "table", data = d, columns = lapply(seq_along(d), function(i) {
+    list(field = names(d)[i], label = strtrim(names(d)[i], 40), width = widths[i], align = align[i])
+  }))
 }
 
 # Format numbers for the report (no NaN/Inf from empty values or a target of 0)
 report_num <- function(x, digits = 2) {
   vapply(x, function(v) if (is.finite(v)) format(round(v, digits), nsmall = digits, trim = TRUE) else "-", "", USE.NAMES = FALSE)
+}
+
+report_sections <- function(r) {
+  docs <- lapply(r$docs, function(d) {
+    value <- if (!d$applicable) "Not applicable" else c(
+      if (nzchar(trimws(report_value(d$text, "")))) report_value(d$text),
+      if (!is.null(d$file)) paste0("Attached PDF: ", d$file$name),
+      if (!is.null(d$unreadable)) paste0("The uploaded file ", d$unreadable, " could not be read and is not attached."),
+      if (!d$provided && is.null(d$unreadable)) "Marked as applicable, but nothing was provided")
+    list(label = d$title, value = paste(value, collapse = "\n"))
+  })
+
+  mc_pieces <- if (!r$mc$ok) list(list(type = "text", text = r$mc$msg)) else list(
+    do.call(report_kv, r$mc$fields),
+    report_table(r$mc$summary, c(.28, .24, .24, .24)),
+    list(type = "image", files = r$mc$plots),
+    list(type = "heading", text = "Raw data", level = 2),
+    report_table(r$mc$raw, c(.2, .4, .4)))
+
+  qc_pieces <- if (!r$qc$ok) list(list(type = "text", text = "No data entered (optional step).")) else c(
+    list(do.call(report_kv, r$qc$fields),
+         list(type = "heading", text = "Results", level = 2),
+         report_table(r$qc$results)),
+    if (r$qc$no_target) list(list(type = "text", text = "Bias and RMSD need a target value above 0.")),
+    list(list(type = "heading", text = "Raw data", level = 2),
+         report_table(r$qc$raw)))
+
+  attachments <- Filter(function(d) !is.null(d$file), r$docs)
+
+  c(list(list(heading = "Project and measurand", pieces = list(do.call(report_kv, r$items))),
+         list(heading = "IVDR documentation", pieces = list(
+           do.call(report_kv, c(docs, list(report_field("Further comments", r$extra, "None")))))),
+         list(heading = "Method comparison", pieces = mc_pieces),
+         list(heading = "Quality control", pieces = qc_pieces),
+         list(heading = "Chemicals and software", pieces = list(
+           report_table(r$chem, c(.26, .18, .14, .26, .16), "left")))),
+    # placeholder pages, replaced by the uploaded PDFs after rendering
+    lapply(attachments, function(d) {
+      list(heading = paste0("Attachment: ", d$title, " (", d$file$name, ")"), reserve_pages = d$pages, pieces = list())
+    }))
 }
 
 # for resizing the column widths of tables
@@ -814,7 +1397,6 @@ server <- function(input, output, session) {
       work <- tempfile("report")
       dir.create(work)
       on.exit(unlink(work, recursive = TRUE), add = TRUE)
-      file.copy(file.path(tempdir(), 'ivdcheckr.rmd'), work)
 
       samples <- setdiff(input$SampleMaterial, "Other")
       if ("Other" %in% input$SampleMaterial) {
@@ -827,9 +1409,12 @@ server <- function(input, output, session) {
         applicable <- !identical(input[[paste0("fileOption", i)]], "Not Applicable")
         upload <- input[[paste0("file", i)]]
         if (!applicable || isTRUE(cleared[[paste0("file", i)]])) upload <- NULL
+        pages <- if (!is.null(upload)) tryCatch(pdf_length(upload$datapath), error = function(e) NA_integer_)
+        unreadable <- if (!is.null(upload) && is.na(pages)) upload$name
+        if (!is.null(unreadable)) upload <- NULL
         text <- input[[paste0("text", i)]]
-        list(title = doc_items[[i]]$title, applicable = applicable, text = text, file = upload,
-             provided = applicable && (!is.null(upload) || nzchar(trimws(report_chars(text)))))
+        list(title = doc_items[[i]]$title, applicable = applicable, text = text, file = upload, pages = pages, unreadable = unreadable,
+             provided = applicable && (!is.null(upload) || nzchar(report_value(text, ""))))
       })
 
       # MC part (the tables only exist once their page has been opened)
@@ -845,16 +1430,27 @@ server <- function(input, output, session) {
         } else {
           co <- getCoefficients(reg)
           ref_range <- function(lo, up) if (isTRUE(up > lo)) paste(lo, "to", up) else "Not specified"
+
+          # The plots are embedded as images, as in the other report engines
+          plots <- file.path(work, c("regression.png", "difference.png"))
+          for (i in 1:2) {
+            png(plots[i], width = 5, height = 5, units = "in", res = 240, bg = "transparent")
+            try(if (i == 1) plot1(mc_raw) else plot2(mc_raw), silent = TRUE)
+            dev.off()
+          }
+
           mc <- list(
-            ok = TRUE, data = mc_raw,
+            ok = TRUE, plots = plots,
+            fields = list(report_field("Method x", input$descx), report_field("Method y", input$descy),
+                          report_field("Reference range x", ref_range(input$refllx, input$refulx)),
+                          report_field("Reference range y", ref_range(input$reflly, input$refuly)),
+                          report_field("Regression function", sprintf("y = %s + %s * x", report_num(co[1, "EST"], 3), report_num(co[2, "EST"], 3))),
+                          report_field("Spearman correlation", report_num(cor(mc_raw$x, mc_raw$y, method = "spearman"), 3)),
+                          report_field("Value pairs", nrow(mc_raw))),
             summary = data.frame(Coefficient = c("Intercept", "Slope"), Estimate = report_num(co[, "EST"], 3),
                                  `95% CI, lower` = report_num(co[, "LCI"], 3), `95% CI, upper` = report_num(co[, "UCI"], 3), check.names = FALSE),
-            info = data.frame(
-              Parameter = c("Method x", "Method y", "Reference range x", "Reference range y", "Regression function", "Spearman correlation", "Value pairs"),
-              Value = c(input$descx, input$descy, ref_range(input$refllx, input$refulx), ref_range(input$reflly, input$refuly),
-                        sprintf("y = %s + %s * x", report_num(co[1, "EST"], 3), report_num(co[2, "EST"], 3)),
-                        report_num(cor(mc_raw$x, mc_raw$y, method = "spearman"), 3), nrow(mc_raw))),
             raw = setNames(data.frame(seq_len(nrow(mc_raw)), mc_raw$x, mc_raw$y), make.unique(c("No.", input$descx, input$descy))))
+          mc$raw[] <- lapply(mc$raw, as.character)
         }
       }
 
@@ -866,8 +1462,8 @@ server <- function(input, output, session) {
       if (qc$ok) {
         res <- calcs(qc_raw)[, toupper(levels), drop = FALSE]
         rows <- qc_raw[rowSums(!is.na(qc_raw[levels])) > 0, levels, drop = FALSE]
-        qc$info <- data.frame(Parameter = c("Analyte", "Description", "QC type"),
-                              Value = c(input$analyte, input$description, if (identical(input$withbetw, "betweenrun")) "Between-run" else "Within-run"))
+        qc$fields <- list(report_field("Analyte", input$analyte), report_field("Description", input$description),
+                          report_field("QC type", if (identical(input$withbetw, "betweenrun")) "Between-run" else "Within-run"))
         qc$results <- cbind(Metric = rownames(res), as.data.frame(lapply(res, report_num)), stringsAsFactors = FALSE)
         qc$no_target <- any(unlist(res["Target value", ]) <= 0, na.rm = TRUE)
         qc$raw <- setNames(cbind(seq_len(nrow(rows)), rows), c("No.", toupper(levels)))
@@ -878,44 +1474,44 @@ server <- function(input, output, session) {
       chem <- table_data()
       chem <- chem[Reduce(`|`, lapply(chem, function(v) nzchar(trimws(ifelse(is.na(v), "", as.character(v)))))), , drop = FALSE]
 
-      r <- list(
-        title = trimws(input$projectInput),
-        period = paste(input$dates[1], input$dates[2], sep = " to "),
-        created = format(Sys.Date(), "%Y-%m-%d"),
+      sections <- report_sections(list(
         items = list(
-          list(label = "1. Measurand description", value = input$ParameterInfo),
-          list(label = "2. Intended use of the measurand", value = input$ParameterUse),
-          list(label = "3. Indication", value = input$Indication),
-          list(label = "4. Scientific validity", value = input$ScientificValidity),
-          list(label = "5. Measurement scale", value = input$MeasurementScale),
-          list(label = "6. Sample material", value = paste(samples, collapse = ", ")),
-          list(label = "7. Risk classification", value = paste0(
-            "Class ", input$RiskClass, if (nzchar(trimws(input$RiskClassDetails))) paste0("\n", input$RiskClassDetails))),
-          list(label = "8. Modification of an existing product (standard) OR new product/development", value = input$ModificationProduct)),
-        docs = docs, extra = input$extraText, mc = mc, qc = qc, chem = chem)
+          report_field("1. Measurand description", input$ParameterInfo),
+          report_field("2. Intended use of the measurand", input$ParameterUse),
+          report_field("3. Indication", input$Indication),
+          report_field("4. Scientific validity", input$ScientificValidity),
+          report_field("5. Measurement scale", input$MeasurementScale),
+          report_field("6. Sample material", samples),
+          report_field("7. Risk classification", paste("Class", input$RiskClass)),
+          report_field("Risk classification details", input$RiskClassDetails),
+          report_field("8. Modification of an existing product (standard) OR new product/development", input$ModificationProduct)),
+        docs = docs, extra = input$extraText, mc = mc, qc = qc, chem = chem))
 
-      preamble <- file.path(work, "preamble.tex")
-      writeLines(enc2utf8(report_preamble(r$title)), preamble, useBytes = TRUE)
-
-      # Render the R Markdown file (plot1/plot2 are found through the parent environment)
-      out <- rmarkdown::render(
-        file.path(work, 'ivdcheckr.rmd'),
-        output_file = "ivdcheckr.pdf",
-        params = list(r = r),
-        envir = new.env(parent = environment()),
-        quiet = TRUE,
-        output_format = pdf_document(latex_engine = "pdflatex", includes = includes(in_header = preamble),
-                                     md_extensions = "-tex_math_single_backslash")
+      raw_pdf <- file.path(work, "report.pdf")
+      rendered <- render_flex_report_pdf(
+        file = raw_pdf,
+        title = "IVDCheckR Report",
+        report_type = "LDT documentation",
+        project_title = report_value(input$projectInput, "Untitled project"),
+        meta_lines = c(paste0("Evaluation period: ", input$dates[1], " to ", input$dates[2]),
+                       paste0("Created: ", format(Sys.Date(), "%Y-%m-%d"))),
+        sections = sections,
+        footer_text = "Created with IVDCheckR",
+        intro_lines = "Documentation of a laboratory developed test (LDT) according to Article 5 (5) of the In Vitro Diagnostic Medical Device Regulation (EU) 2017/746 (EU-IVDR)."
       )
 
-      # Append the uploaded PDF files
-      uploaded_pdf_paths <- unlist(lapply(docs, function(d) d$file$datapath))
-
-      if (length(uploaded_pdf_paths) > 0) {
-        pdf_combine(c(out, uploaded_pdf_paths), file)
-      } else {
-        file.copy(out, file, overwrite = TRUE)
+      # Swap the reserved placeholder pages for the uploaded PDFs
+      final_pdf <- raw_pdf
+      uploads <- unlist(lapply(docs, function(d) d$file$datapath))
+      if (length(uploads) > 0) {
+        inserted <- file.path(work, "attachments.pdf")
+        pdf_combine(uploads, inserted)
+        final_pdf <- pdfreport_splice_pdf(raw_pdf, inserted, attr(rendered, "reserved_pages"), file.path(work, "final.pdf"))
+        if (identical(final_pdf, raw_pdf)) {
+          showNotification("The uploaded PDFs could not be attached.", type = "warning", duration = 15)
+        }
       }
+      file.copy(final_pdf, file, overwrite = TRUE)
     }
   )
 
