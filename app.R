@@ -682,7 +682,7 @@ render_flex_report_pdf <- function(file, title, report_type = "", project_title 
           img_w <- min(slot_w, 55)
           img_h <- min(img_w * asp * (y_scale / x_scale), 40)
           x0 <- x_left + (i - 1) * (slot_w + 2) + (slot_w - img_w) / 2
-          rasterImage(img, x0, y_cursor - img_h, x0 + img_w, y_cursor)
+          rasterImage(img, x0, y_cursor - img_h - 1, x0 + img_w, y_cursor - 1)
         }
         y_cursor <- y_cursor - item$height
       } else if (identical(item$kind, "table_header")) {
@@ -1434,7 +1434,7 @@ server <- function(input, output, session) {
           # The plots are embedded as images, as in the other report engines
           plots <- file.path(work, c("regression.png", "difference.png"))
           for (i in 1:2) {
-            png(plots[i], width = 5, height = 5, units = "in", res = 240, bg = "transparent")
+            png(plots[i], width = 5, height = 5, units = "in", res = 240)
             try(if (i == 1) plot1(mc_raw) else plot2(mc_raw), silent = TRUE)
             dev.off()
           }
